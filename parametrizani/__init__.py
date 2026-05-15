@@ -51,10 +51,18 @@ def generate_conformer(molecule_input, input_type='smiles', work_dir='./work', o
 
 
 def calculate_reference_energies(conformer_files, angles=None, method='torchani',
-                                  work_dir='./work', optimize=True, device='cpu'):
-    """Quick reference energy calculation for a dihedral scan."""
+                                  work_dir='./work', optimize=True, device='cpu',
+                                  dihedral_indices=None):
+    """Quick reference energy calculation for a dihedral scan.
+    
+    Parameters
+    ----------
+    dihedral_indices : list of int, optional
+        Four atom indices defining the dihedral to constrain during optimization.
+    """
     calc = ReferenceEnergyCalculator(method, work_dir, device)
-    return calc.scan_dihedral(conformer_files, angles, optimize=optimize)
+    return calc.scan_dihedral(conformer_files, angles, optimize=optimize,
+                              dihedral_indices=dihedral_indices)
 
 
 def optimize_dihedral(ref_angles, ref_energies, atom_types=None,

@@ -116,7 +116,6 @@ class ReferenceEnergyCalculator:
         import torch
         self.torch = torch
         
-        # Try multiple ways to load AIMNet2
         self.aimnet2_model = None
         
         # Method 1: Try the aimnet2 pip package
@@ -131,7 +130,7 @@ class ReferenceEnergyCalculator:
         except (ImportError, AttributeError, Exception):
             pass
         
-        # Method 2: Try loading from cloned repo path
+        # Method 2: Try loading from common paths
         model_paths = [
             'AIMNet2/models/aimnet2_wb97m-d3_ens.jpt',
             '/content/AIMNet2/models/aimnet2_wb97m-d3_ens.jpt',
@@ -156,7 +155,7 @@ class ReferenceEnergyCalculator:
         model_file = os.path.join(clone_dir, 'models', 'aimnet2_wb97m-d3_ens.jpt')
         if os.path.exists(model_file):
             self.aimnet2_model = torch.jit.load(model_file, map_location=self.device)
-            logger.info(f"AIMNet2 loaded from cloned repo")
+            logger.info("AIMNet2 loaded from cloned repo")
         else:
             raise RuntimeError(
                 "Could not load AIMNet2 model. Try:\n"
@@ -167,7 +166,6 @@ class ReferenceEnergyCalculator:
     def _setup_mace(self):
         """Set up MACE-OFF calculator."""
         try:
-            # Fix potential circular import with torchvision on Colab
             import torch
             try:
                 import torchvision
@@ -205,8 +203,33 @@ class ReferenceEnergyCalculator:
                 "xtb-python not installed. Install: conda install -c conda-forge xtb-python"
             )
     
+    def _apply_dihedral_constraint(self, atoms, dihedral_indices: List[int]):
+        """
+        Apply a dihedral constraint to keep the target dihedral fixed during optimization.
+        
+        Uses ASE's FixInternals to constrain the dihedral angle to its current value.
+        
+        Parameters
+        ----------
+        atoms : ase.Atoms
+            ASE atoms object.
+        dihedral_indices : List[int]
+            Four atom indices defining the dihedral to constrain.
+        """
+        from ase.constraints import FixInternals
+        
+        # Get the current dihedral angle value
+        current_dihedral = atoms.get_dihedral(*dihedral_indices)
+        
+        # Apply the constraint: fix dihedral at its current value
+        constraint = FixInternals(dihedrals_deg=[[current_dihedral, dihedral_indices]])
+        atoms.set_constraint(constraint)
+        
+        return current_dihedral
+    
     def calculate_energy(self, mol_file: str, optimize: bool = True,
-                        fmax: float = 0.05, steps: int = 200) -> Dict[str, Any]:
+                        fmax: float = 0.05, steps: int = 200,
+                        dihedral_indices: Optional[List[int]] = None) -> Dict[str, Any]:
         """
         Calculate energy of a single conformer.
         
@@ -220,6 +243,9 @@ class ReferenceEnergyCalculator:
             Force convergence criterion for optimization.
         steps : int
             Maximum optimization steps.
+        dihedral_indices : Optional[List[int]]
+            Four atom indices defining the dihedral to constrain during optimization.
+            If provided, the dihedral angle is kept fixed at its current value.
             
         Returns
         -------
@@ -230,25 +256,29 @@ class ReferenceEnergyCalculator:
         atoms = ase_read(mol_file)
         
         if self.method in ['torchani', 'ani2x', 'ani1x', 'ani1ccx']:
-            return self._calc_torchani(atoms, optimize, fmax, steps)
+            return self._calc_torchani(atoms, optimize, fmax, steps, dihedral_indices)
         elif self.method in ['ani2xr', 'ani2dr', 'ani2xr_snn', 'ani_mbis']:
-            return self._calc_torchani2(atoms, optimize, fmax, steps)
+            return self._calc_torchani2(atoms, optimize, fmax, steps, dihedral_indices)
         elif self.method == 'mace':
-            return self._calc_mace(atoms, optimize, fmax, steps)
+            return self._calc_mace(atoms, optimize, fmax, steps, dihedral_indices)
         elif self.method in ['xtb', 'gfn2xtb']:
-            return self._calc_xtb(atoms, optimize, fmax, steps)
+            return self._calc_xtb(atoms, optimize, fmax, steps, dihedral_indices)
         elif self.method == 'aimnet2':
-            return self._calc_aimnet2(atoms, optimize, fmax, steps)
+            return self._calc_aimnet2(atoms, optimize, fmax, steps, dihedral_indices)
     
-    def _calc_torchani(self, atoms, optimize, fmax, steps) -> Dict[str, Any]:
+    def _calc_torchani(self, atoms, optimize, fmax, steps, dihedral_indices=None) -> Dict[str, Any]:
         """Calculate energy using TorchANI."""
         import torch
         
         # Optimize geometry using ASE + TorchANI calculator
         if optimize:
             from ase.optimize import BFGS
-            # Use model.ase() - compatible with torchani >= 2.2
             atoms.calc = self.model.ase()
+            
+            # Apply dihedral constraint before optimization
+            if dihedral_indices is not None:
+                self._apply_dihedral_constraint(atoms, dihedral_indices)
+            
             opt = BFGS(atoms, logfile=None)
             opt.run(fmax=fmax, steps=steps)
         
@@ -265,7 +295,6 @@ class ReferenceEnergyCalculator:
         rho = 0.0
         try:
             member_energies = []
-            # Access individual ensemble members via the model's internals
             aev_result = self.model.aev_computer((species, coordinates))
             for i, nn in enumerate(self.model.neural_networks):
                 member_species_energies = nn(aev_result)
@@ -274,7 +303,6 @@ class ReferenceEnergyCalculator:
             if len(member_energies) > 1:
                 rho = float(np.std(member_energies)) * HARTREE_TO_KCAL
         except Exception:
-            # If ensemble access fails (API changed), skip rho calculation
             pass
         
         return {
@@ -284,56 +312,68 @@ class ReferenceEnergyCalculator:
             'positions': atoms.get_positions(),
         }
     
-    def _calc_torchani2(self, atoms, optimize, fmax, steps) -> Dict[str, Any]:
+    def _calc_torchani2(self, atoms, optimize, fmax, steps, dihedral_indices=None) -> Dict[str, Any]:
         """Calculate energy using TorchANI2."""
         import torch
+        
+        if optimize:
+            from ase.optimize import BFGS
+            atoms.calc = self.model.ase()
+            
+            # Apply dihedral constraint before optimization
+            if dihedral_indices is not None:
+                self._apply_dihedral_constraint(atoms, dihedral_indices)
+            
+            opt = BFGS(atoms, logfile=None)
+            opt.run(fmax=fmax, steps=steps)
+        
         species = torch.tensor([atoms.get_atomic_numbers()], dtype=torch.long, device=self.device)
         coordinates = torch.tensor(
             [atoms.get_positions()], dtype=torch.float32,
             device=self.device, requires_grad=True
         )
-        if optimize:
-            from ase.optimize import BFGS
-            atoms.calc = self.model.ase()
-            opt = BFGS(atoms, logfile=None)
-            opt.run(fmax=fmax, steps=steps)
-            coordinates = torch.tensor(
-                [atoms.get_positions()], dtype=torch.float32,
-                device=self.device, requires_grad=True
-            )
         result = self.model(species, coordinates)
         energy_hartree = result.energies.item()
         return {'energy': energy_hartree, 'energy_kcal': energy_hartree * HARTREE_TO_KCAL, 'rho': 0.0, 'positions': atoms.get_positions()}
     
-    def _calc_mace(self, atoms, optimize, fmax, steps) -> Dict[str, Any]:
+    def _calc_mace(self, atoms, optimize, fmax, steps, dihedral_indices=None) -> Dict[str, Any]:
         """Calculate energy using MACE-OFF."""
         atoms.calc = self.mace_calc
         if optimize:
             from ase.optimize import BFGS
+            
+            # Apply dihedral constraint before optimization
+            if dihedral_indices is not None:
+                self._apply_dihedral_constraint(atoms, dihedral_indices)
+            
             opt = BFGS(atoms, logfile=None)
             opt.run(fmax=fmax, steps=steps)
         energy_ev = atoms.get_potential_energy()
         energy_kcal = energy_ev * 23.0609  # eV to kcal/mol
         return {'energy': energy_ev, 'energy_kcal': energy_kcal, 'rho': 0.0, 'positions': atoms.get_positions()}
     
-    def _calc_xtb(self, atoms, optimize, fmax, steps) -> Dict[str, Any]:
+    def _calc_xtb(self, atoms, optimize, fmax, steps, dihedral_indices=None) -> Dict[str, Any]:
         """Calculate energy using GFN2-xTB."""
         from xtb.ase.calculator import XTB
         atoms.calc = XTB(method="GFN2-xTB")
         if optimize:
             from ase.optimize import BFGS
+            
+            # Apply dihedral constraint before optimization
+            if dihedral_indices is not None:
+                self._apply_dihedral_constraint(atoms, dihedral_indices)
+            
             opt = BFGS(atoms, logfile=None)
             opt.run(fmax=fmax, steps=steps)
         energy_ev = atoms.get_potential_energy()
         energy_kcal = energy_ev * 23.0609
         return {'energy': energy_ev, 'energy_kcal': energy_kcal, 'rho': 0.0, 'positions': atoms.get_positions()}
     
-    def _calc_aimnet2(self, atoms, optimize, fmax, steps) -> Dict[str, Any]:
+    def _calc_aimnet2(self, atoms, optimize, fmax, steps, dihedral_indices=None) -> Dict[str, Any]:
         """Calculate energy using AIMNet2."""
         import torch
         
         if optimize:
-            # Use ASE interface for optimization
             from ase.optimize import BFGS
             from ase.calculators.calculator import Calculator, all_changes
             
@@ -357,6 +397,11 @@ class ReferenceEnergyCalculator:
                         self.results['forces'] = -res['forces'].squeeze(0).detach().cpu().numpy() * HARTREE_TO_KCAL * 4.184 / 96.485 / 0.529177
             
             atoms.calc = AIMNet2ASECalc(self.aimnet2_model, self.device)
+            
+            # Apply dihedral constraint before optimization
+            if dihedral_indices is not None:
+                self._apply_dihedral_constraint(atoms, dihedral_indices)
+            
             opt = BFGS(atoms, logfile=None)
             opt.run(fmax=fmax, steps=steps)
         
@@ -387,7 +432,8 @@ class ReferenceEnergyCalculator:
         angles: Optional[List[float]] = None,
         optimize: bool = True,
         fmax: float = 0.05,
-        steps: int = 200
+        steps: int = 200,
+        dihedral_indices: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
         """
         Calculate energies for a dihedral scan.
@@ -399,7 +445,11 @@ class ReferenceEnergyCalculator:
         angles : Optional[List[float]]
             Corresponding dihedral angles. If None, extracted from filenames.
         optimize : bool
-            Whether to optimize each conformer.
+            Whether to optimize each conformer (with dihedral constrained).
+        dihedral_indices : Optional[List[int]]
+            Four atom indices defining the dihedral. Required for constrained
+            optimization. The dihedral angle is kept fixed at its value in each
+            conformer file while all other degrees of freedom are relaxed.
             
         Returns
         -------
@@ -419,10 +469,15 @@ class ReferenceEnergyCalculator:
                     angles.append(float(basename))
         
         logger.info(f"Scanning {len(conformer_files)} conformers with {self.method}...")
+        if dihedral_indices is not None:
+            logger.info(f"  Dihedral constraint on atoms: {dihedral_indices}")
         
         for i, mol_file in enumerate(conformer_files):
             try:
-                result = self.calculate_energy(mol_file, optimize=optimize, fmax=fmax, steps=steps)
+                result = self.calculate_energy(
+                    mol_file, optimize=optimize, fmax=fmax, steps=steps,
+                    dihedral_indices=dihedral_indices
+                )
                 energies.append(result['energy_kcal'])
                 rho_values.append(result.get('rho', 0.0))
                 if (i + 1) % 5 == 0:

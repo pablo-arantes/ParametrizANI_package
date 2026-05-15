@@ -56,7 +56,7 @@ class EnergyMinimizer:
         force_constant : float
             Force constant for dihedral restraint.
         opt_tol : float
-            Convergence tolerance for minimization.
+            Convergence tolerance for minimization (kJ/mol/nm).
             
         Returns
         -------
@@ -105,7 +105,10 @@ class EnergyMinimizer:
             integrator = mm.LangevinIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.002*unit.picoseconds)
             simulation = mm.app.Simulation(prmtop.topology, system, integrator)
             simulation.context.setPositions(pdbfile.positions)
-            simulation.minimizeEnergy(tolerance=opt_tol*unit.kilojoule_per_mole)
+            simulation.minimizeEnergy(
+                tolerance=opt_tol*unit.kilojoule_per_mole/unit.nanometer,
+                maxIterations=1000000
+            )
             
             state = simulation.context.getState(getEnergy=True)
             energy_kj = state.getPotentialEnergy().value_in_unit(unit.kilocalorie_per_mole)
@@ -189,7 +192,10 @@ class EnergyMinimizer:
             integrator = mm.LangevinIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.002*unit.picoseconds)
             simulation = mm.app.Simulation(pdbfile.topology, system, integrator)
             simulation.context.setPositions(pdbfile.positions)
-            simulation.minimizeEnergy(tolerance=opt_tol*unit.kilojoule_per_mole)
+            simulation.minimizeEnergy(
+                tolerance=opt_tol*unit.kilojoule_per_mole/unit.nanometer,
+                maxIterations=1000000
+            )
             
             state = simulation.context.getState(getEnergy=True)
             energy = state.getPotentialEnergy().value_in_unit(unit.kilocalorie_per_mole)
