@@ -4,6 +4,7 @@ ParametrizANI - Reference Energy Calculator
 
 Calculate reference energies using ML potentials:
 - TorchANI (ANI-2x, ANI-1x, ANI-1ccx)
+- TorchANI2 (ANI-2xr, ANI-2dr, ANI-2xr-Snn, ANI-mbis)
 - AIMNet2
 - MACE-OFF
 - GFN2-xTB
@@ -112,21 +113,86 @@ class ReferenceEnergyCalculator:
     
     def _setup_aimnet2(self):
         """Set up AIMNet2 calculator."""
+        import torch
+        self.torch = torch
+        
+        # Try multiple ways to load AIMNet2
+        self.aimnet2_model = None
+        
+        # Method 1: Try the aimnet2 pip package
         try:
-            import torch
-            self.torch = torch
-            logger.info("AIMNet2 calculator initialized")
-        except ImportError:
-            raise ImportError("AIMNet2 dependencies not found.")
+            import aimnet2
+            self.aimnet2_model = torch.jit.load(
+                aimnet2.download_model('aimnet2_wb97m-d3_ens'),
+                map_location=self.device
+            )
+            logger.info("AIMNet2 loaded from pip package")
+            return
+        except (ImportError, AttributeError, Exception):
+            pass
+        
+        # Method 2: Try loading from cloned repo path
+        model_paths = [
+            'AIMNet2/models/aimnet2_wb97m-d3_ens.jpt',
+            '/content/AIMNet2/models/aimnet2_wb97m-d3_ens.jpt',
+            os.path.join(self.work_dir, 'AIMNet2/models/aimnet2_wb97m-d3_ens.jpt'),
+        ]
+        for path in model_paths:
+            if os.path.exists(path):
+                self.aimnet2_model = torch.jit.load(path, map_location=self.device)
+                logger.info(f"AIMNet2 loaded from {path}")
+                return
+        
+        # Method 3: Clone the repo
+        import subprocess
+        clone_dir = os.path.join(self.work_dir, 'AIMNet2')
+        if not os.path.exists(clone_dir):
+            logger.info("Cloning AIMNet2 repository...")
+            subprocess.run(
+                f"git clone https://github.com/isayevlab/AIMNet2.git {clone_dir}",
+                shell=True, capture_output=True
+            )
+        
+        model_file = os.path.join(clone_dir, 'models', 'aimnet2_wb97m-d3_ens.jpt')
+        if os.path.exists(model_file):
+            self.aimnet2_model = torch.jit.load(model_file, map_location=self.device)
+            logger.info(f"AIMNet2 loaded from cloned repo")
+        else:
+            raise RuntimeError(
+                "Could not load AIMNet2 model. Try:\n"
+                "  git clone https://github.com/isayevlab/AIMNet2.git\n"
+                "  # or: pip install aimnet2"
+            )
     
     def _setup_mace(self):
         """Set up MACE-OFF calculator."""
         try:
+            # Fix potential circular import with torchvision on Colab
+            import torch
+            try:
+                import torchvision
+            except (ImportError, AttributeError):
+                pass
+            
             from mace.calculators import mace_off
             self.mace_calc = mace_off(model="medium", device=self.device)
             logger.info("MACE-OFF calculator initialized")
         except ImportError:
-            raise ImportError("MACE not installed. Install with: pip install mace-torch")
+            raise ImportError(
+                "MACE not installed. Install with:\n"
+                "  pip install mace-torch\n"
+                "If you get a torchvision error, try:\n"
+                "  pip install --upgrade torchvision\n"
+                "  pip install mace-torch"
+            )
+        except AttributeError as e:
+            if 'torchvision' in str(e):
+                raise ImportError(
+                    "Circular import with torchvision. Fix by running:\n"
+                    "  pip install --upgrade torchvision\n"
+                    "Then restart the runtime and try again."
+                )
+            raise
     
     def _setup_xtb(self):
         """Set up GFN2-xTB calculator."""
@@ -177,30 +243,40 @@ class ReferenceEnergyCalculator:
     def _calc_torchani(self, atoms, optimize, fmax, steps) -> Dict[str, Any]:
         """Calculate energy using TorchANI."""
         import torch
+        
+        # Optimize geometry using ASE + TorchANI calculator
+        if optimize:
+            from ase.optimize import BFGS
+            # Use model.ase() - compatible with torchani >= 2.2
+            atoms.calc = self.model.ase()
+            opt = BFGS(atoms, logfile=None)
+            opt.run(fmax=fmax, steps=steps)
+        
+        # Calculate energy with the model directly
         species = torch.tensor([atoms.get_atomic_numbers()], dtype=torch.long, device=self.device)
         coordinates = torch.tensor(
             [atoms.get_positions()], dtype=torch.float32,
             device=self.device, requires_grad=True
         )
-        if optimize:
-            from ase.optimize import BFGS
-            from torchani.ase import Calculator as ANICalculator
-            atoms.calc = ANICalculator(self.model.species, self.model)
-            opt = BFGS(atoms, logfile=None)
-            opt.run(fmax=fmax, steps=steps)
-            species = torch.tensor([atoms.get_atomic_numbers()], dtype=torch.long, device=self.device)
-            coordinates = torch.tensor(
-                [atoms.get_positions()], dtype=torch.float32,
-                device=self.device, requires_grad=True
-            )
         energy = self.model((species, coordinates)).energies
         energy_hartree = energy.item()
-        # Reliability from ensemble disagreement
-        energies_members = []
-        for member in self.model:
-            e = member((species, coordinates)).energies.item()
-            energies_members.append(e)
-        rho = np.std(energies_members) * HARTREE_TO_KCAL if len(energies_members) > 1 else 0.0
+        
+        # Calculate ensemble disagreement (rho) for reliability estimate
+        rho = 0.0
+        try:
+            member_energies = []
+            # Access individual ensemble members via the model's internals
+            aev_result = self.model.aev_computer((species, coordinates))
+            for i, nn in enumerate(self.model.neural_networks):
+                member_species_energies = nn(aev_result)
+                member_shifted = self.model.energy_shifter(member_species_energies)
+                member_energies.append(member_shifted.energies.item())
+            if len(member_energies) > 1:
+                rho = float(np.std(member_energies)) * HARTREE_TO_KCAL
+        except Exception:
+            # If ensemble access fails (API changed), skip rho calculation
+            pass
+        
         return {
             'energy': energy_hartree,
             'energy_kcal': energy_hartree * HARTREE_TO_KCAL,
@@ -255,17 +331,55 @@ class ReferenceEnergyCalculator:
     def _calc_aimnet2(self, atoms, optimize, fmax, steps) -> Dict[str, Any]:
         """Calculate energy using AIMNet2."""
         import torch
-        model_path = os.environ.get('AIMNET2_MODEL', 'AIMNet2/models/aimnet2_wb97m-d3_ens.jpt')
-        model = torch.jit.load(model_path, map_location=self.device)
-        species = torch.tensor([atoms.get_atomic_numbers()], dtype=torch.long, device=self.device)
+        
+        if optimize:
+            # Use ASE interface for optimization
+            from ase.optimize import BFGS
+            from ase.calculators.calculator import Calculator, all_changes
+            
+            class AIMNet2ASECalc(Calculator):
+                implemented_properties = ['energy', 'forces']
+                def __init__(self, model, device):
+                    Calculator.__init__(self)
+                    self.model = model
+                    self.device = device
+                def calculate(self, atoms=None, properties=['energy'], system_changes=all_changes):
+                    Calculator.calculate(self, atoms, properties, system_changes)
+                    species = torch.tensor(self.atoms.get_atomic_numbers(), dtype=torch.long, device=self.device)
+                    coords = torch.tensor(
+                        self.atoms.get_positions(), dtype=torch.float64,
+                        device=self.device
+                    ).unsqueeze(0).requires_grad_(True)
+                    inp = {'coord': coords, 'numbers': species, 'charge': torch.tensor([0.0], device=self.device)}
+                    res = self.model(inp)
+                    self.results['energy'] = res['energy'].item() * HARTREE_TO_KCAL * 4.184 / 96.485  # Hartree to eV
+                    if 'forces' in res:
+                        self.results['forces'] = -res['forces'].squeeze(0).detach().cpu().numpy() * HARTREE_TO_KCAL * 4.184 / 96.485 / 0.529177
+            
+            atoms.calc = AIMNet2ASECalc(self.aimnet2_model, self.device)
+            opt = BFGS(atoms, logfile=None)
+            opt.run(fmax=fmax, steps=steps)
+        
+        # Final energy calculation
+        species = torch.tensor(atoms.get_atomic_numbers(), dtype=torch.long, device=self.device)
         coordinates = torch.tensor(
-            [atoms.get_positions()], dtype=torch.float64,
-            device=self.device, requires_grad=True
-        )
-        input_dict = {'coord': coordinates, 'numbers': species[0], 'charge': torch.tensor([0.0], device=self.device)}
-        result = model(input_dict)
+            atoms.get_positions(), dtype=torch.float64, device=self.device
+        ).unsqueeze(0).requires_grad_(True)
+        
+        input_dict = {
+            'coord': coordinates,
+            'numbers': species,
+            'charge': torch.tensor([0.0], device=self.device)
+        }
+        result = self.aimnet2_model(input_dict)
         energy_hartree = result['energy'].item()
-        return {'energy': energy_hartree, 'energy_kcal': energy_hartree * HARTREE_TO_KCAL, 'rho': 0.0, 'positions': atoms.get_positions()}
+        
+        return {
+            'energy': energy_hartree,
+            'energy_kcal': energy_hartree * HARTREE_TO_KCAL,
+            'rho': 0.0,
+            'positions': atoms.get_positions(),
+        }
     
     def scan_dihedral(
         self,
